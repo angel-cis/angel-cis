@@ -1,16 +1,26 @@
-## Hi there 👋
 
-<!--
-**angel-cis/angel-cis** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+# Hi, I'm Angel!
 
-Here are some ideas to get you started:
+I'm a Computer Science and Engineering student at the
+University of California, Merced.
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+## About Me
+- Interested in software development, robotics, and automation
+- Experience with programming, databases, and IT troubleshooting
+- Former IT classroom mentor with two years of experience
+- Currently working on a ROS 2 autonomous warehouse search robot
+
+## Technical Skills
+- Languages: Python, C++, C, Java, R
+- Web: HTML, CSS, JSX
+- Other: ROS 2, Gazebo, computer troubleshooting
+
+## Featured Projects
+- Music Rating and Review Website
+- RISC-V Pipelined Processor Simulator
+- Paint Application in C++
+- Autonomous Warehouse Search Robot (In Progress)
+
+## Connect With Me
+- LinkedIn: [LinkedIn URL]
+- Portfolio: [Portfolio URL]
