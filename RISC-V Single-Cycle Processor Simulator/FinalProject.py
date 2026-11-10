@@ -1,0 +1,409 @@
+import sys
+
+# Global Variables
+pc = 0
+next_pc = 0
+branch_target = 0
+total_clock_cycles = 0
+
+# Register file and Data Memory
+register_file = [0] * 32
+data_memory = [0] * 32
+
+# ALU Output signals
+alu_result = 0
+alu_zero = 0
+mem_read_data = 0
+
+# Control Signals
+RegWrite = 0
+MemRead = 0
+MemWrite = 0
+Branch = 0
+ALUOp = 0
+ALUSrc = 0
+MemtoReg = 0
+JAL = 0
+JALR = 0
+WritePC = 0
+
+
+def sign_extend(value: int, bits: int) -> int:
+    if value & (1 << (bits - 1)):
+        return value - (1 << bits)
+    return value
+
+
+def to_signed32(x: int) -> int:
+    x &= 0xFFFFFFFF
+    if x & 0x80000000:
+        return x - 0x100000000
+    return x
+
+
+def ControlUnit(opcode: int):
+    global RegWrite, MemRead, MemWrite, Branch, ALUOp, ALUSrc, MemtoReg, JAL, JALR, WritePC
+
+    # Reset all signals each cycle
+    RegWrite = 0
+    MemRead = 0
+    MemWrite = 0
+    Branch = 0
+    ALUOp = 0
+    ALUSrc = 0
+    MemtoReg = 0
+    JAL = 0
+    JALR = 0
+    WritePC = 0
+
+    if opcode == 0x33:      # R-type (add, sub, and, or)
+        RegWrite = 1
+        ALUOp = 2
+
+    elif opcode == 0x13:    # I-type ALU (addi, andi, ori)
+        RegWrite = 1
+        ALUSrc = 1
+        ALUOp = 3
+
+    elif opcode == 0x03:    # lw
+        RegWrite = 1
+        MemRead = 1
+        ALUSrc = 1
+        MemtoReg = 1
+        ALUOp = 0           # ADD for address calculation
+
+    elif opcode == 0x23:    # sw
+        MemWrite = 1
+        ALUSrc = 1
+        ALUOp = 0           # ADD for address calculation
+
+    elif opcode == 0x63:    # beq
+        Branch = 1
+        ALUOp = 1           # SUB to compare
+
+    elif opcode == 0x6F:    # jal
+        RegWrite = 1
+        JAL = 1
+        WritePC = 1
+
+    elif opcode == 0x67:    # jalr
+        RegWrite = 1
+        ALUSrc = 1
+        JALR = 1
+        WritePC = 1
+
+    else:
+        raise ValueError(f"Unsupported opcode: 0x{opcode:02x}")
+
+
+def ALUControl(ALUOp: int, funct3: int, funct7: int) -> int:
+    # alu_ctrl codes:
+    # 0 = AND, 1 = OR, 2 = ADD, 6 = SUB
+
+    if ALUOp == 0:
+        return 2    # ADD for lw / sw address calculation
+
+    elif ALUOp == 1:
+        return 6    # SUB for beq comparison
+
+    elif ALUOp == 2:  # R-type
+        if funct3 == 0x0 and funct7 == 0x00:
+            return 2    # add
+        elif funct3 == 0x0 and funct7 == 0x20:
+            return 6    # sub
+        elif funct3 == 0x7 and funct7 == 0x00:
+            return 0    # and
+        elif funct3 == 0x6 and funct7 == 0x00:
+            return 1    # or
+        else:
+            raise ValueError(f"Unsupported R-type funct3=0x{funct3:x} funct7=0x{funct7:x}")
+
+    elif ALUOp == 3:  # I-type ALU
+        if funct3 == 0x0:
+            return 2    # addi
+        elif funct3 == 0x7:
+            return 0    # andi
+        elif funct3 == 0x6:
+            return 1    # ori
+        else:
+            raise ValueError(f"Unsupported I-type funct3=0x{funct3:x}")
+
+    return 2
+
+
+def Fetch(instrs: list):
+    """
+    Reads the instruction pointed to by pc.
+    pc is treated as a byte address; instruction index = pc // 4.
+    Sets next_pc = pc + 4.
+    Returns the 32-bit instruction integer, or None if out of range.
+    """
+    global pc, next_pc
+
+    idx = pc // 4
+    if idx < 0 or idx >= len(instrs):
+        return None
+
+    next_pc = pc + 4
+    return instrs[idx]
+
+
+def Decode(instr: int, fetch_pc: int):
+    """
+    Decodes instruction fields, calls ControlUnit, reads register file,
+    performs sign extension, and returns values needed by Execute.
+    fetch_pc is the PC value at the time of fetch (used for branch/JAL target).
+    """
+    opcode  = instr & 0x7F
+    rd      = (instr >> 7)  & 0x1F
+    funct3  = (instr >> 12) & 0x07
+    rs1     = (instr >> 15) & 0x1F
+    rs2     = (instr >> 20) & 0x1F
+    funct7  = (instr >> 25) & 0x7F
+
+    ControlUnit(opcode)
+
+    rs1_val = register_file[rs1]
+    rs2_val = register_file[rs2]
+
+    simm = 0
+
+    if opcode in (0x13, 0x03, 0x67):   # I-type (ALU / load / JALR)
+        imm12 = (instr >> 20) & 0xFFF
+        simm = sign_extend(imm12, 12)
+
+        if opcode == 0x03 and funct3 != 0x2:
+            raise ValueError("Only lw (funct3=2) is supported for loads")
+
+        if opcode == 0x67 and funct3 != 0x0:
+            raise ValueError("Only jalr (funct3=0) is supported")
+
+    elif opcode == 0x23:    # S-type (sw)
+        if funct3 != 0x2:
+            raise ValueError("Only sw (funct3=2) is supported for stores")
+        imm11_5 = (instr >> 25) & 0x7F
+        imm4_0  = (instr >> 7)  & 0x1F
+        simm = sign_extend((imm11_5 << 5) | imm4_0, 12)
+
+    elif opcode == 0x63:    # SB-type (beq)
+        if funct3 != 0x0:
+            raise ValueError("Only beq (funct3=0) is supported for branches")
+        imm12   = (instr >> 31) & 0x1
+        imm10_5 = (instr >> 25) & 0x3F
+        imm4_1  = (instr >> 8)  & 0xF
+        imm11   = (instr >> 7)  & 0x1
+        # Assemble the 13-bit immediate (bit 0 is always 0)
+        imm13 = (imm12 << 12) | (imm11 << 11) | (imm10_5 << 5) | (imm4_1 << 1)
+        simm = sign_extend(imm13, 13)
+
+    elif opcode == 0x6F:    # J-type (jal)
+        imm20    = (instr >> 31) & 0x1
+        imm10_1  = (instr >> 21) & 0x3FF
+        imm11    = (instr >> 20) & 0x1
+        imm19_12 = (instr >> 12) & 0xFF
+        # Assemble the 21-bit immediate (bit 0 is always 0)
+        imm21 = (imm20 << 20) | (imm19_12 << 12) | (imm11 << 11) | (imm10_1 << 1)
+        simm = sign_extend(imm21, 21)
+
+    elif opcode == 0x33:    # R-type — no immediate
+        pass
+
+    alu_ctrl = ALUControl(ALUOp, funct3, funct7)
+
+    return rd, rs1_val, rs2_val, simm, alu_ctrl
+
+
+def Execute(rs1_val: int, rs2_val: int, simm: int, alu_ctrl: int, fetch_pc: int):
+    """
+    Performs ALU operation and computes branch/jump targets.
+    fetch_pc: the PC captured at Fetch time, used for branch_target = fetch_pc + simm.
+    next_pc (global) = fetch_pc + 4, used for JAL/JALR return address.
+    """
+    global alu_result, alu_zero, branch_target
+
+    operand2 = simm if ALUSrc else rs2_val
+
+    if alu_ctrl == 0:       # AND
+        alu_result = to_signed32(rs1_val & operand2)
+    elif alu_ctrl == 1:     # OR
+        alu_result = to_signed32(rs1_val | operand2)
+    elif alu_ctrl == 2:     # ADD
+        alu_result = to_signed32(rs1_val + operand2)
+    elif alu_ctrl == 6:     # SUB
+        alu_result = to_signed32(rs1_val - operand2)
+    else:
+        raise ValueError(f"Unsupported ALU control signal: {alu_ctrl}")
+
+    alu_zero = 1 if alu_result == 0 else 0
+
+    # Branch target calculation per spec:
+    #   branch_target = fetch_pc + simm   (simm already encodes the ×2 shift for beq/jal)
+    # For JALR: branch_target = (rs1 + simm) with LSB cleared
+    if JALR:
+        branch_target = to_signed32(rs1_val + simm) & ~1
+    else:
+        # Works for beq, jal, and is computed (but ignored) for other instructions
+        branch_target = fetch_pc + simm
+
+
+def Mem(rs2_val: int):
+    """
+    Handles data memory reads (lw) and writes (sw).
+    Memory is byte-addressed; each d_mem entry is 4 bytes.
+    """
+    global mem_read_data
+
+    mem_read_data = 0
+
+    if not MemRead and not MemWrite:
+        return
+
+    # alu_result holds the byte address; convert to word index
+    mem_idx = alu_result // 4
+
+    if 0 <= mem_idx < 32:
+        if MemRead:
+            mem_read_data = data_memory[mem_idx]
+        if MemWrite:
+            data_memory[mem_idx] = to_signed32(rs2_val)
+    else:
+        raise ValueError(f"Memory address out of range: 0x{alu_result & 0xFFFFFFFF:x}")
+
+
+def WriteBack(rd: int):
+    """
+    Writes the result back to the register file and increments the cycle counter.
+    For JAL/JALR (WritePC=1): writes next_pc (= fetch_pc + 4) to rd.
+    For lw (MemtoReg=1): writes mem_read_data to rd.
+    Otherwise: writes alu_result to rd.
+    """
+    global total_clock_cycles
+
+    if RegWrite and rd != 0:
+        if WritePC:
+            register_file[rd] = to_signed32(next_pc)
+        elif MemtoReg:
+            register_file[rd] = to_signed32(mem_read_data)
+        else:
+            register_file[rd] = to_signed32(alu_result)
+
+    register_file[0] = 0    # x0 is always 0
+    total_clock_cycles += 1
+
+
+# ABI register name table
+REG_NAMES = {
+    0: "zero", 1: "ra",  2: "sp",  3: "gp",  4: "tp",
+    5: "t0",   6: "t1",  7: "t2",
+    8: "s0",   9: "s1",
+    10: "a0",  11: "a1", 12: "a2", 13: "a3",
+    14: "a4",  15: "a5", 16: "a6", 17: "a7",
+    18: "s2",  19: "s3", 20: "s4", 21: "s5",
+    22: "s6",  23: "s7", 24: "s8", 25: "s9",
+    26: "s10", 27: "s11",
+    28: "t3",  29: "t4", 30: "t5", 31: "t6"
+}
+
+
+def init_part1():
+    """Initialize registers and data memory for Part 1."""
+    register_file[1]  = 0x20    # x1
+    register_file[2]  = 0x5     # x2
+    register_file[10] = 0x70    # x10
+    register_file[11] = 0x4     # x11
+    # d_mem: address 0x70 → index 28, address 0x74 → index 29
+    data_memory[0x70 // 4] = 0x5
+    data_memory[0x74 // 4] = 0x10
+
+
+def init_part2():
+    """Initialize registers and data memory for Part 2."""
+    register_file[8]  = 0x20    # s0  = x8
+    register_file[10] = 0x5     # a0  = x10
+    register_file[11] = 0x2     # a1  = x11
+    register_file[12] = 0xA     # a2  = x12
+    register_file[13] = 0xF     # a3  = x13
+    # data memory all zeros (already initialized)
+
+
+def main():
+    global pc
+
+    print("Which part to run? (1 or 2):")
+    part = input().strip()
+
+    if part == "1":
+        init_part1()
+    elif part == "2":
+        init_part2()
+    else:
+        print("Invalid part selection.")
+        return
+
+    print("Enter the program file name to run:")
+    filename = input().strip()
+
+    try:
+        with open(filename, "r") as f:
+            instrs = [int(line.strip(), 2) for line in f if line.strip()]
+    except FileNotFoundError:
+        print(f"File not found: {filename}")
+        return
+    except ValueError as e:
+        print(f"Invalid data in file (expected 32-bit binary strings): {e}")
+        return
+
+    pc = 0  # Reset PC
+
+    while True:
+        old_rf  = list(register_file)
+        old_mem = list(data_memory)
+
+        # ── FETCH ──────────────────────────────────────────────────────────
+        fetch_pc = pc                       # Capture PC before it changes
+        instr = Fetch(instrs)
+        if instr is None:
+            break                           # PC out of instruction range → halt
+
+        # ── DECODE ─────────────────────────────────────────────────────────
+        rd, rs1_val, rs2_val, simm, alu_ctrl = Decode(instr, fetch_pc)
+
+        # ── EXECUTE ────────────────────────────────────────────────────────
+        Execute(rs1_val, rs2_val, simm, alu_ctrl, fetch_pc)
+
+        # ── MEMORY ─────────────────────────────────────────────────────────
+        Mem(rs2_val)
+
+        # ── WRITE BACK ─────────────────────────────────────────────────────
+        WriteBack(rd)
+
+        # ── NEXT PC SELECTION ──────────────────────────────────────────────
+        if JAL or JALR:
+            pc = branch_target
+        elif Branch and alu_zero:
+            pc = branch_target
+        else:
+            pc = next_pc
+
+        # ── PRINT CYCLE RESULTS ────────────────────────────────────────────
+        print(f"total_clock_cycles {total_clock_cycles} :")
+
+        for i in range(32):
+            if register_file[i] != old_rf[i]:
+                print(f"{REG_NAMES.get(i, f'x{i}')} is modified to "
+                      f"0x{register_file[i] & 0xFFFFFFFF:x}")
+
+        for i in range(32):
+            if data_memory[i] != old_mem[i]:
+                print(f"memory 0x{i * 4:x} is modified to "
+                      f"0x{data_memory[i] & 0xFFFFFFFF:x}")
+
+        print(f"pc is modified to 0x{pc:x}")
+        print()
+
+    print("program terminated:")
+    print(f"total execution time is {total_clock_cycles} cycles")
+
+
+if __name__ == "__main__":
+    main()
