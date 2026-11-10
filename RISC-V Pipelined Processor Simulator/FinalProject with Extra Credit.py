@@ -1,0 +1,390 @@
+import sys
+
+# Global Variables
+
+pc = 0 # Program Counter
+next_pc = 0 # Next Program Counter
+branch_target = 0 # Target Address
+total_clock_cycles = 0
+
+register_file = [0] * 32 # 32 general purpose register
+data_memory = [0] * 32 # 32 word data memory
+
+alu_result = 0
+alu_zero = 0 # Flag if ALU result is zero
+mem_read_data = 0 # Reads data from memory
+
+# Control Signals
+RegWrite = MemRead = MemWrite = Branch = 0
+ALUOp = ALUSrc = MemtoReg = 0
+JAL = JALR = WritePC = 0
+
+# Pipeline Registers
+IF_ID = {"instr": None}
+ID_EX = {}
+EX_MEM = {}
+MEM_WB = {}
+
+# Register names
+register_names = {
+    1: 'ra', 2: 'sp',
+    8: 's0', 9: 's1',
+    10: 'a0', 11: 'a1', 12: 'a2', 13: 'a3', 14: 'a4', 15: 'a5', 16: 'a6', 17: 'a7',
+    18: 's2', 19: 's3', 20: 's4', 21: 's5', 22: 's6', 23: 's7', 24: 's8', 25: 's9', 26: 's10', 27: 's11',
+    28: 't3', 29: 't4', 30: 't5', 31: 't6'
+}
+
+# Utility Functions
+def sign_extend(value, bits):
+    if value & (1 << (bits - 1)):
+        return value - (1 << bits)
+    return value
+
+def to_signed32(x):
+    return x - 0x100000000 if x & 0x80000000 else x
+
+# Control
+def ControlUnit(opcode):
+    global RegWrite, MemRead, MemWrite, Branch, ALUOp, ALUSrc, MemtoReg, JAL, JALR, WritePC
+
+    RegWrite = MemRead = MemWrite = Branch = 0
+    ALUOp = ALUSrc = MemtoReg = 0
+    JAL = JALR = WritePC = 0
+
+    if opcode == 0x33:
+        RegWrite = 1; ALUOp = 2
+    elif opcode == 0x13:
+        RegWrite = 1; ALUSrc = 1; ALUOp = 3
+    elif opcode == 0x03:
+        RegWrite = 1; MemRead = 1; ALUSrc = 1; MemtoReg = 1
+    elif opcode == 0x23:
+        MemWrite = 1; ALUSrc = 1
+    elif opcode == 0x63:
+        Branch = 1; ALUOp = 1
+    elif opcode == 0x6F:
+        RegWrite = 1; JAL = 1; WritePC = 1
+    elif opcode == 0x67:
+        RegWrite = 1; ALUSrc = 1; JALR = 1; WritePC = 1
+    
+def ALUControlUnit(ALUOp, funct3, funct7):
+    if ALUOp == 0:
+        return 2
+    if ALUOp == 1:
+        return 6
+    if ALUOp == 2:
+        if funct3 == 0 and funct7 == 0:
+            return 2
+        if funct3 == 0 and funct7 == 0x20:
+            return 6
+        if funct3 == 7:
+            return 0
+        if funct3 == 6:
+            return 1
+    if ALUOp == 3:
+        if funct3 == 0:
+            return 2
+        if funct3 == 7:
+            return 0
+        if funct3 == 6:
+            return 1
+        
+# Single Cycle Execution
+def Fetch(instrs):
+    global pc, next_pc
+
+    idx = pc // 4
+    if idx >= len(instrs):
+        return None
+    next_pc = pc + 4
+    return instrs[idx]
+
+def Decode(instr):
+    opcode = instr & 0x7F
+    rd = (instr >> 7) & 0x1F
+    funct3 = (instr >> 12) & 7
+    rs1 = (instr >> 15) & 0x1F
+    rs2 = (instr >> 20) & 0x1F
+    funct7 = (instr >> 25) & 0x7F
+
+    ControlUnit(opcode)
+
+    rs1_val = register_file[rs1]
+    rs2_val = register_file[rs2]
+
+    simm = 0
+
+    if opcode in (0x13, 0x03, 0x67):
+        simm = sign_extend(instr >> 20, 12)
+    elif opcode == 0x23:
+        simm = sign_extend(((instr >> 25) << 5) | ((instr >> 7) & 0x1F), 12)
+    elif opcode == 0x63:
+        imm = ((instr >> 31) << 12) | (((instr >> 7) & 1) << 11) | (((instr >> 25) & 0x3F) << 5) | (((instr >> 8) & 0xF) << 1)
+        simm = sign_extend(imm, 13)
+    elif opcode == 0x6F:
+        imm = ((instr >> 31) << 20) | (((instr >> 12) & 0xFF) << 12) | (((instr >> 20) & 1) << 11) | (((instr >> 21) & 0x3FF) << 1)
+        simm = sign_extend(imm, 21)
+
+    alu_control = ALUControlUnit(ALUOp, funct3, funct7)
+    return rd, rs1_val, rs2_val, simm, alu_control
+
+def Execute(rd, rs1_val, rs2_val, simm, alu_control):
+    global alu_result, alu_zero, branch_target
+    op2 = simm if ID_EX["ALUSrc"] else rs2_val
+
+    if alu_control == 0:
+        alu_result = to_signed32(rs1_val & op2)
+    elif alu_control == 1:
+        alu_result = to_signed32(rs1_val | op2)
+    elif alu_control == 2:
+        alu_result = to_signed32(rs1_val + op2)
+    elif alu_control == 6:
+        alu_result = to_signed32(rs1_val - op2)
+    
+    alu_zero = int(alu_result == 0)
+    branch_target = pc + simm
+    
+
+
+def Mem(rs2_val, MemRead, MemWrite):
+    global mem_read_data
+    mem_read_data = 0
+    idx = alu_result // 4
+
+    if 0 <= idx < 32:
+        if MemRead:
+            mem_read_data = data_memory[idx]
+        if MemWrite:
+            data_memory[idx] = to_signed32(rs2_val)
+
+def WriteBack(rd):
+    global total_clock_cycles
+    if RegWrite and rd != 0:
+        if WritePC:
+            register_file[rd] = next_pc
+        else:
+            register_file[rd] = mem_read_data if MemtoReg else alu_result
+
+    register_file[0] = 0
+    total_clock_cycles += 1
+
+# Pipeline Execution
+def Fetch_stage(instrs):
+    global pc, next_pc, IF_ID
+    idx = pc // 4
+    if idx >= len(instrs):
+        IF_ID["instr"] = None
+        return
+    IF_ID["instr"] = instrs[idx]
+    next_pc = pc + 4
+
+def Decode_stage():
+    global ID_EX
+    instr = IF_ID.get("instr")
+    if instr is None:
+        ID_EX.clear()
+        return
+    
+    rd, rs1, rs2, imm, alu_control = Decode(instr)
+
+    ID_EX = {
+        "rd": rd, "rs1_val": rs1, "rs2_val": rs2,
+        "imm": imm, "alu_control": alu_control,
+        "RegWrite": RegWrite, "MemRead": MemRead, 
+        "MemWrite": MemWrite, "MemtoReg": MemtoReg,
+        "ALUSrc": ALUSrc, "Branch": Branch,
+        "JAL": JAL, "JALR": JALR, "WritePC": WritePC,
+        "pc": pc
+    }
+
+def Execute_stage():
+    global EX_MEM, pc, branch_taken
+    if not ID_EX:
+        EX_MEM.clear()
+        return
+    
+    branch_taken = False
+    
+    Execute(ID_EX["rd"], ID_EX["rs1_val"], ID_EX["rs2_val"], ID_EX["imm"], ID_EX["alu_control"])
+
+    if ID_EX["Branch"] and alu_zero:
+        pc = branch_target
+        branch_taken = True
+    elif ID_EX["WritePC"]:
+        pc = branch_target
+        branch_taken = True
+
+    EX_MEM = {
+        "alu_result": alu_result, "zero": alu_zero,
+        "rs2_val": ID_EX["rs2_val"], "rd": ID_EX["rd"],
+        "RegWrite": ID_EX["RegWrite"], "MemRead": ID_EX["MemRead"], 
+        "MemWrite": ID_EX["MemWrite"], "MemtoReg": ID_EX["MemtoReg"],
+        "WritePC": ID_EX["WritePC"]
+    }
+    
+
+def Mem_stage():
+    global MEM_WB
+    if not EX_MEM:
+        MEM_WB.clear()
+        return
+    
+    Mem(EX_MEM["rs2_val"], EX_MEM["MemRead"], EX_MEM["MemWrite"])
+
+    MEM_WB = {
+        "alu_result": EX_MEM["alu_result"], "mem_read_data": mem_read_data,
+        "rd": EX_MEM["rd"], "RegWrite": EX_MEM["RegWrite"],
+        "MemtoReg": EX_MEM["MemtoReg"], "WritePC": EX_MEM["WritePC"]
+    }
+
+def WriteBack_stage():
+    if not MEM_WB:
+        return
+    
+    rd = MEM_WB["rd"]
+    if MEM_WB["RegWrite"] and rd != 0:
+        if MEM_WB["WritePC"]:
+            register_file[rd] = next_pc
+        else:
+            register_file[rd] = MEM_WB["mem_read_data"] if MEM_WB["MemtoReg"] else MEM_WB["alu_result"]
+    
+    register_file[0] = 0
+
+def hazard_detected():
+    if not IF_ID or IF_ID["instr"] is None:
+        return False
+    instr = IF_ID["instr"]
+    opcode = instr & 0x7F
+    rs1 = (instr >> 15) & 0x1F
+    rs2 = (instr >> 20) & 0x1F
+
+    uses_rs1 = opcode in (0x33, 0x13, 0x03, 0x23, 0x63, 0x67)
+    uses_rs2 = opcode in (0x33, 0x23, 0x63)
+
+    hazard_ex_mem = EX_MEM.get("RegWrite") and EX_MEM.get("rd") != 0 and (
+        (uses_rs1 and EX_MEM["rd"] == rs1) or (uses_rs2 and EX_MEM["rd"] == rs2)
+    )
+
+    hazard_mem_wb = MEM_WB.get("RegWrite") and MEM_WB.get("rd") != 0 and (
+        (uses_rs1 and MEM_WB["rd"] == rs1) or (uses_rs2 and MEM_WB["rd"] == rs2)
+    )
+
+
+    return hazard_ex_mem or hazard_mem_wb
+
+# Main
+def main():
+    global pc, register_file, data_memory, total_clock_cycles
+
+    PIPELINE = True     # Set to False for single cycle execution
+    branch_taken = False
+
+    print("Enter the program file name to run:")
+    filename = input().strip()
+
+    register_file = [0] * 32
+    data_memory = [0] * 32
+    pc = 0
+    total_clock_cycles = 0
+
+    # Request init
+    if "2" in filename:
+        register_file[8] = 0x20
+        register_file[10] = 0x5
+        register_file[11] = 0x2
+        register_file[12] = 0xA
+        register_file[13] = 0xF
+
+    register_file[1] = 0x20
+    register_file[2] = 0x5
+    register_file[10] = 0x70
+    register_file[11] = 0x4
+    data_memory[28] = 0x5
+    data_memory[29] = 0x10
+
+    with open(filename) as f:
+        instrs = [int(line.strip(), 2) for line in f if line.strip()]
+    
+    if not PIPELINE:
+        while pc // 4 < len(instrs):
+            instr = Fetch(instrs)
+            if instr is None:
+                break
+            rd, rs1_val, rs2_val, simm, alu_control = Decode(instr)
+            Execute(rd, rs1_val, rs2_val, simm, alu_control)
+            Mem(rs2_val)
+            WriteBack(rd)
+
+            if JAL or JALR:
+                pc = branch_target
+            elif Branch and alu_zero:
+                pc = branch_target
+            else:
+                pc = next_pc
+            
+            print(f"total_clock_cycles: {total_clock_cycles} :")
+            for i in range(1, 32):
+                if register_file[i] != old_reg[i]:
+                    name = register_names.get(i, f"x{i}")
+                    print(f"{name} is modified to 0x{register_file[i] & 0xFFFFFFFF:x}")
+
+            for i in range(32):
+                if data_memory[i] != old_mem[i]:
+                    print(f"data_memory[{i}] is modified to 0x{data_memory[i] & 0xFFFFFFFF:x}")
+            
+            print(f"pc is modified to 0x{pc:x}\n")
+    else:
+        # PIPELINE
+        while True:
+            old_reg = list(register_file)
+            old_mem = list(data_memory)
+
+            WriteBack_stage()
+            Mem_stage()
+            Execute_stage()
+
+            # if hazard_detected():
+            #     ID_EX.clear()
+            # else:
+            #     Decode_stage()
+            #     Fetch_stage(instrs)
+
+            # if not branch_taken:
+            #     pc = next_pc
+
+            is_stalled = hazard_detected()
+
+            if is_stalled:
+                ID_EX.clear()
+            else:
+                Decode_stage()
+                Fetch_stage(instrs)
+
+            if not branch_taken and not is_stalled:
+                pc = next_pc
+            
+            total_clock_cycles += 1
+
+            if total_clock_cycles >= 5:
+            # if MEM_WB:
+                print(f"total_clock_cycles: {total_clock_cycles} :")
+                for i in range(1, 32):
+                    if register_file[i] != old_reg[i]:
+                        name = register_names.get(i, f"x{i}")
+                        print(f"{name} is modified to 0x{register_file[i] & 0xFFFFFFFF:x}")
+
+                for i in range(32):
+                    if data_memory[i] != old_mem[i]:
+                        print(f"data_memory[{i}] is modified to 0x{data_memory[i] & 0xFFFFFFFF:x}")
+                
+                print(f"pc is modified to 0x{pc:x}\n")
+
+            if IF_ID["instr"] is None and not ID_EX and not EX_MEM and not MEM_WB:
+                break
+
+    print(f"program terminated:")
+    print(f"total execution time is {total_clock_cycles} cycles")
+
+if __name__ == "__main__":
+
+
+    main()
