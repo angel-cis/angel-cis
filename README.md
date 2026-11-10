@@ -22,5 +22,5 @@ University of California, Merced.
 - Autonomous Warehouse Search Robot (In Progress)
 
 ## Connect With Me
-- LinkedIn: [LinkedIn URL]
+- LinkedIn: https://www.linkedin.com/in/angel-cisneros-736a31305/
 - Portfolio: [Portfolio URL]
